@@ -70,6 +70,15 @@ chainlit run app.py
 
 Then open http://localhost:8000. Add `-w` to reload automatically when the code changes.
 
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The tests run offline: GitHub, the MCP session and the LLM are replaced with fakes.
+
 ## Project layout
 
 ```
@@ -78,6 +87,7 @@ Then open http://localhost:8000. Add `-w` to reload automatically when the code 
 ├── mcp_server.py           MCP server: GitHub tools, resource, report prompts
 ├── chainlit.md             In-app Readme
 ├── .chainlit/config.toml   Chainlit settings (app name)
+├── tests/                  Offline unit tests (pytest)
 ├── requirements.txt
 └── .env.example
 ```
