@@ -13,7 +13,8 @@ ENV/
 
 # Chainlit runtime artifacts (auto-generated on first run)
 .files/
-.chainlit/
+.chainlit/*
+!.chainlit/config.toml
 
 # IDE
 .vscode/

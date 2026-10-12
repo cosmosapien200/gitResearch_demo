@@ -1,19 +1,19 @@
-# DevPulse — GitHub Intelligence Agent 🚀
+# gitResearch 🔎
 
-Ask questions about any GitHub repository. Get live data powered by the GitHub API.
+Research any GitHub repository with live data from the GitHub API.
 
-## Example Questions
+## Report commands
 
-- "What are the stars on microsoft/autogen?"
-- "Show me open issues on facebook/react"
-- "Who are the top contributors to langchain-ai/langchain?"
+Type `/` in the chat box, or click a starter on the empty chat screen.
+
+- **/Health** `owner/repo`: is it maintained and safe to depend on? 🟢 / 🟡 / 🔴 verdict
+- **/Compare** `owner/repo vs owner/repo`: side-by-side comparison to help you choose
+- **/Triage** `owner/repo`: open issues sorted by type and priority
+
+Every report has a downloadable Markdown copy.
+
+## Or just ask
+
 - "What's the latest release of vercel/next.js?"
+- "Who are the top contributors to langchain-ai/langchain?"
 - "Search for repositories about machine learning in Python"
-
-## How It Works
-
-1. **Ask** a question about a GitHub repository
-2. **Approve** tool calls when prompted (human-in-the-loop)
-3. **Receive** live results from the GitHub API
-
-Every tool execution requires your explicit approval before it runs.

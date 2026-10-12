@@ -1,10 +1,13 @@
+import base64
 import os
+from datetime import datetime, timezone
+
 import httpx
 from mcp.server.fastmcp import FastMCP
 
 
 # -- SETUP ---------------------------------------------------------------
-mcp = FastMCP("DevPulse GitHub Intelligence Server")
+mcp = FastMCP("gitResearch GitHub Intelligence Server")
 
 
 GITHUB_API = "https://api.github.com"
@@ -12,7 +15,7 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")    # optional, raises rate limit 6
 
 
 # GitHub requires a User-Agent header on every request, or it rejects the call.
-_HEADERS = {"User-Agent": "DevPulse-MCP-Server"}
+_HEADERS = {"User-Agent": "gitResearch-MCP-Server"}
 if GITHUB_TOKEN:
     _HEADERS["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
@@ -39,6 +42,20 @@ def _friendly_error(status: int, data: dict, context: str) -> str:
     if status == -1:
         return f"ERROR: could not reach GitHub. {data.get('message')}"
     return f"ERROR: GitHub API returned status {status} for {context}: {data.get('message', 'unknown error')}"
+
+
+
+def _days_ago(iso_timestamp: str) -> str:
+    """'2026-10-07T10:03:29Z' -> '5 days ago'. Computed here because the LLM
+    doesn't reliably know today's date."""
+    then = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
+    days = (datetime.now(timezone.utc) - then).days
+    return "today" if days == 0 else f"{days} day{'s' if days != 1 else ''} ago"
+
+
+
+def _clamp(limit: int, maximum: int = 20) -> int:
+    return max(1, min(limit, maximum))
 
 
 
@@ -72,27 +89,74 @@ def get_repo_details(owner: str, repo: str) -> str:
     if status != 200:
         return _friendly_error(status, data, f"{owner}/{repo}")
     license_name = (data.get("license") or {}).get("name", "No license")
-    return (f"{data['full_name']}: {data.get('description', 'No description')}\n"
+    return (f"{data['full_name']}: {data.get('description') or 'No description'}\n"
             f"{data['stargazers_count']:,} stars | {data['forks_count']:,} forks | "
-            f"Language: {data.get('language', 'N/A')} | License: {license_name}\n"
-            f"Open issues: {data['open_issues_count']} | Default branch: {data['default_branch']}")
+            f"Language: {data.get('language') or 'N/A'} | License: {license_name}\n"
+            f"Open issues + PRs: {data['open_issues_count']} | Default branch: {data['default_branch']}\n"
+            f"Created: {data['created_at'][:10]} | Last push: {_days_ago(data['pushed_at'])}"
+            f"{' | ARCHIVED (read-only)' if data.get('archived') else ''}")
+
+
+
+@mcp.tool()
+def get_readme(owner: str, repo: str) -> str:
+    """Get the README of a GitHub repository, to understand what the project does.
+    Args: owner, repo
+    """
+    status, data = _get(f"/repos/{owner}/{repo}/readme")
+    if status != 200:
+        return _friendly_error(status, data, f"{owner}/{repo} README")
+    # GitHub returns the file base64-encoded inside the JSON response.
+    text = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+    if len(text) > 3000:
+        text = text[:3000] + "\n...(truncated)"
+    return f"README of {owner}/{repo}:\n\n{text}"
+
+
+
+@mcp.tool()
+def get_recent_commits(owner: str, repo: str, limit: int = 10) -> str:
+    """List the most recent commits on a repository's default branch, with how long ago
+    each was made. Use this to judge whether a project is actively maintained.
+    Args: owner, repo, limit (max commits to return, default 10)
+    """
+    status, data = _get(f"/repos/{owner}/{repo}/commits", params={"per_page": _clamp(limit)})
+    if status != 200:
+        return _friendly_error(status, data, f"{owner}/{repo} commits")
+    if not data:
+        return f"{owner}/{repo} has no commits."
+    latest = data[0]["commit"]["author"]["date"]
+    lines = [f"Recent commits to {owner}/{repo} (latest was {_days_ago(latest)}):"]
+    for c in data:
+        date = c["commit"]["author"]["date"]
+        author = (c.get("author") or {}).get("login") or c["commit"]["author"]["name"]
+        message = c["commit"]["message"].splitlines()[0][:80]
+        lines.append(f"- {date[:10]} ({_days_ago(date)}) {c['sha'][:7]} by {author}: {message}")
+    return "\n".join(lines)
 
 
 
 @mcp.tool()
 def list_open_issues(owner: str, repo: str, limit: int = 5) -> str:
-    """List currently open issues for a GitHub repository.
+    """List currently open issues (not pull requests) for a GitHub repository,
+    with labels, age, comment count and the start of each issue's description.
     Args: owner, repo, limit (max issues to return, default 5)
     """
-    status, data = _get(f"/repos/{owner}/{repo}/issues", params={"state": "open", "per_page": limit})
+    # The issues endpoint also returns pull requests; over-fetch, then filter them out.
+    status, data = _get(f"/repos/{owner}/{repo}/issues",
+                        params={"state": "open", "per_page": min(_clamp(limit) * 3, 100)})
     if status != 200:
         return _friendly_error(status, data, f"{owner}/{repo} issues")
-    if not data:
+    issues = [i for i in data if "pull_request" not in i][:_clamp(limit)]
+    if not issues:
         return f"{owner}/{repo} currently has no open issues."
-    lines = [f"Open issues for {owner}/{repo} (showing {len(data)}):"]
-    for issue in data:
+    lines = [f"Open issues for {owner}/{repo} (showing {len(issues)}):"]
+    for issue in issues:
         labels = ", ".join(l["name"] for l in issue.get("labels", [])) or "no labels"
-        lines.append(f"- #{issue['number']}: {issue['title']} [{labels}]")
+        body = " ".join((issue.get("body") or "").split())[:200]
+        lines.append(f"- #{issue['number']}: {issue['title']} [{labels}] "
+                     f"(opened {_days_ago(issue['created_at'])}, {issue['comments']} comments)\n"
+                     f"  {body or '(no description)'}")
     return "\n".join(lines)
 
 
@@ -102,7 +166,7 @@ def list_contributors(owner: str, repo: str, limit: int = 5) -> str:
     """List the top contributors to a GitHub repository by commit count.
     Args: owner, repo, limit (max contributors to return, default 5)
     """
-    status, data = _get(f"/repos/{owner}/{repo}/contributors", params={"per_page": limit})
+    status, data = _get(f"/repos/{owner}/{repo}/contributors", params={"per_page": _clamp(limit)})
     if status != 200:
         return _friendly_error(status, data, f"{owner}/{repo} contributors")
     if not data:
@@ -120,10 +184,12 @@ def get_latest_release(owner: str, repo: str) -> str:
     Args: owner, repo
     """
     status, data = _get(f"/repos/{owner}/{repo}/releases/latest")
+    if status == 404:
+        return f"{owner}/{repo} has no published releases."
     if status != 200:
         return _friendly_error(status, data, f"{owner}/{repo} latest release")
-    return (f"Latest release of {owner}/{repo}: {data['tag_name']} ({data.get('name', '')})\n"
-            f"Published: {data['published_at']}\n"
+    return (f"Latest release of {owner}/{repo}: {data['tag_name']} ({data.get('name') or ''})\n"
+            f"Published: {data['published_at'][:10]} ({_days_ago(data['published_at'])})\n"
             f"Notes: {(data.get('body') or 'No release notes.')[:300]}")
 
 
@@ -144,20 +210,107 @@ def repo_summary_resource(owner: str, repo: str) -> str:
 
 
 
-# -- PROMPT (reusable instruction template) --------------------------------
+# -- PROMPTS (reusable workflow templates) ---------------------------------
+# The client fetches these by name with get_prompt() and sends the result to
+# the LLM as the user's request. The server owns the workflow; the agent just
+# follows it, choosing and calling the tools itself.
+
+
+HEALTH_RULES = """Rate each area 🟢 / 🟡 / 🔴 using these rules:
+- Maintenance: last commit < 30 days 🟢, 30-180 days 🟡, older 🔴 (an archived repo is always 🔴)
+- Releases: latest release < 90 days 🟢, 90-365 days 🟡, older or none 🔴
+- Community: 5+ active contributors or 1,000+ stars 🟢, a few contributors 🟡, a single person 🔴
+- Issues: open issues getting attention (recent, commented) 🟢, piling up 🟡, ignored 🔴
+- License: OSI license (MIT, Apache, BSD, GPL...) 🟢, other 🟡, none 🔴"""
 
 
 @mcp.prompt()
-def issue_triage_prompt() -> str:
-    """A structured workflow for triaging a GitHub issue."""
-    return """
-    Review this GitHub issue and:
-    1. Classify it as exactly one of: Bug / Feature Request / Question / Documentation
-    2. Assign a priority: Critical / High / Medium / Low, based on impact described
-    3. Suggest which existing label(s) it should carry
-    4. Write a one-sentence summary suitable for a triage dashboard
-    Be concise -- output should fit in 4 short lines.
-    """
+def repo_health_check(owner: str, repo: str) -> str:
+    """Full health report for one repository: is it maintained and safe to depend on?"""
+    return f"""Run a health check on the GitHub repository {owner}/{repo}.
+
+First gather the facts with your tools: get_repo_details, get_readme, get_recent_commits,
+get_latest_release, list_contributors and list_open_issues for {owner}/{repo}.
+
+{HEALTH_RULES}
+
+Then write the report in exactly this markdown format:
+
+## 🩺 Health Report: {owner}/{repo}
+**Verdict:** <🟢 Healthy / 🟡 Slowing down / 🔴 Risky> — <one sentence why>
+
+**What it is:** <2 sentences from the README>
+
+| Area | Finding | Status |
+|---|---|---|
+| Maintenance | ... | 🟢/🟡/🔴 |
+| Releases | ... | ... |
+| Community | ... | ... |
+| Issues | ... | ... |
+| License | ... | ... |
+
+**Should you use it?** <2-3 sentences of practical advice>
+
+Only use facts returned by the tools. Reply with only the markdown above: no extra
+sections, nothing before or after it, no follow-up questions."""
+
+
+@mcp.prompt()
+def compare_repos(repo_a: str, repo_b: str) -> str:
+    """Side-by-side comparison of two repositories (each given as owner/repo)."""
+    return f"""Compare the GitHub repositories {repo_a} and {repo_b} to help a developer choose one.
+
+For EACH repository, gather the facts with your tools: get_repo_details, get_readme,
+get_recent_commits, get_latest_release and list_contributors.
+
+{HEALTH_RULES}
+
+Then write the comparison in exactly this markdown format:
+
+## ⚖️ {repo_a} vs {repo_b}
+
+| | {repo_a} | {repo_b} |
+|---|---|---|
+| What it is | ... | ... |
+| Stars / Forks | ... | ... |
+| Language / License | ... | ... |
+| Maintenance | <finding> 🟢/🟡/🔴 | ... |
+| Releases | ... | ... |
+| Community | ... | ... |
+
+**Pick {repo_a} if:** <one sentence>
+**Pick {repo_b} if:** <one sentence>
+**Overall:** <one sentence recommendation>
+
+Only use facts returned by the tools. Reply with only the markdown above: no extra
+sections, nothing before or after it, no follow-up questions."""
+
+
+@mcp.prompt()
+def triage_issues(owner: str, repo: str) -> str:
+    """Triage the open issues of a repository into type and priority."""
+    return f"""Triage the open issues of the GitHub repository {owner}/{repo}.
+
+First fetch them with list_open_issues (owner="{owner}", repo="{repo}", limit=10).
+
+For each issue decide:
+1. Type: exactly one of Bug / Feature / Question / Docs
+2. Priority: Critical / High / Medium / Low, based on the impact described
+   (crashes, security, data loss, many users affected -> higher)
+3. A one-line summary suitable for a triage dashboard
+
+Then write the result in exactly this markdown format:
+
+## 🗂️ Issue Triage: {owner}/{repo}
+
+| Issue | Type | Priority | Summary |
+|---|---|---|---|
+| #<number> <short title> | ... | ... | ... |
+
+**Fix first:** <the 3 most urgent issue numbers, one short reason each>
+
+Only use facts returned by the tools. Reply with only the markdown above: no extra
+sections, nothing before or after it, no follow-up questions."""
 
 
 
@@ -168,11 +321,11 @@ def issue_triage_prompt() -> str:
 
 if __name__ == "__main__":
     import sys
-    print("Starting DevPulse MCP Server...", file=sys.stderr)
-    print("5 tools: search_repositories, get_repo_details, list_open_issues, "
-          "list_contributors, get_latest_release", file=sys.stderr)
+    print("Starting gitResearch MCP Server...", file=sys.stderr)
+    print("7 tools: search_repositories, get_repo_details, get_readme, get_recent_commits, "
+          "list_open_issues, list_contributors, get_latest_release", file=sys.stderr)
     print("1 resource: github://repo/{owner}/{repo}/summary", file=sys.stderr)
-    print("1 prompt: issue_triage_prompt", file=sys.stderr)
+    print("3 prompts: repo_health_check, compare_repos, triage_issues", file=sys.stderr)
     if not GITHUB_TOKEN:
         print("NOTE: no GITHUB_TOKEN set -- limited to 60 unauthenticated requests/hour.",
               file=sys.stderr)
