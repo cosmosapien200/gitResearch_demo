@@ -404,20 +404,133 @@ All settings live in `.env` (template: [.env.example](.env.example)), loaded wit
 
 ---
 
-## 10. Concepts used
+## 10. Course concepts in this project
 
-| Concept | Where it appears |
-|---|---|
-| Agentic AI vs plain generative AI | The agent plans and acts with tools instead of answering from training data |
-| ReAct (Reason + Act) loop | `GitResearchAgent.ask()` |
-| Tool / function calling | OpenAI-format tool schemas, `tool_choice="auto"` |
-| Model Context Protocol: tools, resources, prompts | `mcp_server.py` |
-| MCP stdio transport and handshake | `mcp_session()` |
-| Dynamic tool discovery | `discover_openai_tools()` |
-| Short-term conversational memory | `self.history` per chat session |
-| Local LLMs with Ollama | `LLM_BACKEND=ollama` |
-| Prompt engineering | System prompt, report templates, scoring rubric, grounding rule |
-| Grounding / reducing hallucination | "Only use facts returned by the tools"; date maths in code |
-| Retrieval on demand | The agent decides when to fetch the README, commits or issues |
-| Streaming and async I/O | `stream=True`, async generator, async clients |
-| Observability | Every tool call visible with inputs and outputs |
+How the topics of the *Building Agents with Agentic AI* course appear in the code:
+
+| Course concept | Where it is | In one line |
+|---|---|---|
+| Generative AI vs agentic AI | The whole app | A plain LLM answers from memory; this agent decides to fetch live data first |
+| Tool / function calling | `tool_choice="auto"` in [agent.py](agent.py) | The LLM returns a *request* for a tool; our code decides to run it |
+| ReAct (Reason + Act) | `GitResearchAgent.ask()` | Think, act, observe, repeat, capped at 12 rounds |
+| Short-term memory | `self.history` | The full conversation is resent every turn, so "it" in a follow-up works |
+| MCP tools | 7 `@mcp.tool()` functions in [mcp_server.py](mcp_server.py) | FastMCP turns Python functions into tool schemas from names, docstrings and type hints |
+| MCP resources | `github://repo/{owner}/{repo}/summary` | Read-only data addressed by a URI |
+| MCP prompts | `repo_health_check`, `compare_repos`, `triage_issues` | Workflow templates owned by the server, fetched with `get_prompt()` |
+| MCP stdio transport | `mcp_session()` | Server runs as a child process; JSON-RPC over stdin/stdout |
+| Dynamic tool discovery | `discover_openai_tools()` | No hard-coded schemas; a new tool needs no agent change |
+| Local LLMs with Ollama | `LLM_BACKEND` in `.env` | Same code runs on Groq (cloud) or Ollama (local) |
+| Prompt engineering | System prompt, report templates, scoring rubric | Fixed rules and formats make output consistent |
+| Grounding / reducing hallucination | "Only use facts returned by the tools"; `_days_ago()` | The model reads real data; date maths is done in code |
+| Retrieval on demand | README, commits, issues tools | The agent decides *when* to fetch extra context, instead of receiving everything up front |
+| Streaming and async I/O | `stream=True`, async generator, async clients | Users see progress immediately; one slow request doesn't block others |
+| Observability | Tool steps in the UI | Every tool call is visible with its inputs and outputs |
+| Testing agents | [tests/](tests) | The LLM and MCP are replaced with fakes, so the loop logic is tested offline |
+
+Course topics **not** used here: LangGraph multi-agent graphs, the A2A protocol, vector-database RAG, watsonx Orchestrate.
+
+---
+
+## 11. Orchestration without a framework
+
+The agent's control flow is a hand-written loop in plain async Python, not LangGraph.
+
+LangGraph describes an agent as a graph of nodes and edges, which pays off when there are several agents,
+branches or pause-and-resume steps. This agent has one cycle, so the loop *is* the graph:
+
+```
+LangGraph view of agent.py:
+
+   ┌─────────┐   tool calls?  yes   ┌──────────┐
+   │ LLM node│ ───────────────────> │ tool node│
+   └─────────┘ <─────────────────── └──────────┘
+        │ no
+        v
+       END
+```
+
+- **LLM node** = the streamed `chat.completions.create(...)` call.
+- **Tool node** = the `for call in calls:` block that runs each tool through MCP.
+- **Conditional edge** = `if not tool_calls: ... return`.
+- **Recursion limit** = `max_loops=12`.
+- **State** = `self.history`.
+
+Writing it by hand keeps every step visible (about 60 lines) and avoids a dependency the problem doesn't need. If
+the project grew to several specialist agents, or needed a human-approval pause in the middle of a run,
+moving to LangGraph would be the natural next step.
+
+---
+
+## 12. Talking points
+
+1. **All three MCP building blocks.** Tools, a resource and prompts; most projects use tools only. Open the
+   "MCP prompt" step in the UI to show the template the server sent.
+2. **Tools are discovered, not hard-coded.** `get_readme` and `get_recent_commits` were added to the server only,
+   and the agent used them immediately.
+3. **The model plans by itself.** Run `/Health fastapi/fastapi` and point at the six tool steps; no code sets the order.
+4. **Consistent, explainable verdicts.** The green/yellow/red thresholds are written in the prompt, so the same
+   repository gets the same verdict and the reason can be traced.
+5. **Real problems solved.** The LLM doesn't know today's date; tool calls arrive in pieces when streaming;
+   Chainlit drew the answer above the steps; models wrote "let me look that up" into the answer.
+6. **Safety by design.** Read-only tools, a loop limit, request timeouts, keys only in `.env`, errors returned as text.
+7. **Live data.** The fastapi/fastapi star count changed from 103,055 to 103,056 between two runs.
+
+---
+
+## 13. Questions and answers
+
+**Why not LangGraph?**
+One agent with one loop covers this problem. The loop is equivalent to a two-node graph (Section 11); LangGraph
+would add structure without adding capability here.
+
+**What stops the model from looping forever?**
+`max_loops=12` in `ask()`. After 12 rounds the agent returns a fallback message. `test_loop_limit` checks this.
+
+**How does the agent know which tools exist?**
+At the start of each question it calls `list_tools()` on the MCP server and converts each tool's JSON Schema into
+the OpenAI tool format in `discover_openai_tools()`.
+
+**Why is the MCP server a separate process?**
+That is how MCP's stdio transport works. It also keeps GitHub code out of the agent, and any other MCP client
+(for example a desktop AI app) could connect to the same server.
+
+**Why `env=os.environ.copy()`?**
+The stdio transport does not pass the parent's environment variables to the child process. Without it the server
+would not see `GITHUB_TOKEN`.
+
+**Why must the server never print to stdout?**
+stdout carries the JSON-RPC protocol messages. A stray `print()` would corrupt them, so logs go to stderr.
+
+**How do you reduce hallucination?**
+The answer is built from tool results, the prompts say to use only facts returned by the tools, and dates are
+calculated in code because the model does not know today's date.
+
+**What is the difference between a tool and a prompt in MCP?**
+The *model* decides to call a tool during reasoning. The *user* chooses a prompt (here, through a `/` command),
+and its text becomes the request the model works on.
+
+**Why fixed scoring rules instead of letting the model judge?**
+So verdicts are consistent between runs and explainable: "Releases is yellow because the last release was 235
+days ago, and the rule is 90 to 365 days."
+
+**How does streaming work with tool calls?**
+The response arrives in chunks. Text chunks are shown immediately. Tool-call chunks carry pieces of the name and
+JSON arguments, which are joined by tool-call index and parsed only when the stream ends.
+
+**How is the agent tested without an LLM or GitHub?**
+`tests/test_agent.py` uses a fake LLM that plays back prepared chunks, and `monkeypatch` replaces the MCP functions.
+The tool tests replace the HTTP helper `_get` with canned responses.
+
+**Is memory permanent?**
+No. It lives in `self.history` for one browser session and is lost on refresh. Long-term memory would need a database.
+
+**What happens if GitHub's rate limit is hit?**
+`_friendly_error()` returns a readable message telling the user to set `GITHUB_TOKEN` (60 → 5,000 requests/hour),
+and the model passes that on instead of crashing.
+
+**Can the agent change anything on GitHub?**
+No. Every tool is a read-only GET request.
+
+**What would you improve next?**
+One persistent MCP session per chat, trimming old history, caching GitHub responses, and a write tool (such as
+labelling an issue) behind a human Approve/Reject button.
